@@ -1,122 +1,310 @@
-require('dotenv').config();
-const express = require('express');
-const crypto = require('crypto');
-const path = require('path');
-const Database = require('better-sqlite3');
 
-const app = express();
-const db = new Database(path.join(__dirname, 'inbox.sqlite'));
-db.pragma('journal_mode = WAL');
-db.exec(`
-CREATE TABLE IF NOT EXISTS conversations (
- id TEXT PRIMARY KEY, platform TEXT NOT NULL, customer_id TEXT NOT NULL,
- customer_name TEXT, last_message TEXT, last_at TEXT, unread INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS messages (
- id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, platform TEXT NOT NULL,
- direction TEXT NOT NULL, body TEXT, created_at TEXT NOT NULL, sender_name TEXT,
- status TEXT DEFAULT 'received'
-);
-`);
-const upsertConversation = db.prepare(`INSERT INTO conversations(id,platform,customer_id,customer_name,last_message,last_at,unread)
-VALUES(@id,@platform,@customer_id,@customer_name,@last_message,@last_at,@unread)
-ON CONFLICT(id) DO UPDATE SET customer_name=COALESCE(excluded.customer_name,conversations.customer_name),
-last_message=excluded.last_message,last_at=excluded.last_at,unread=conversations.unread+excluded.unread`);
-const insertMessage = db.prepare(`INSERT OR IGNORE INTO messages(id,conversation_id,platform,direction,body,created_at,sender_name,status)
-VALUES(@id,@conversation_id,@platform,@direction,@body,@created_at,@sender_name,@status)`);
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Hub-Signature-256"
+};
 
-function requiredEnv(name) { const v=process.env[name]; if(!v) throw new Error(`Missing server configuration: ${name}`); return v; }
-function basicAuth(req,res,next) {
-  const header=req.headers.authorization||'';
-  if(!header.startsWith('Basic ')){res.set('WWW-Authenticate','Basic realm="Crispy Town Inbox"');return res.status(401).end('Authentication required');}
-  let pair=''; try { pair=Buffer.from(header.slice(6),'base64').toString(); } catch {}
-  const i=pair.indexOf(':'); const user=pair.slice(0,i), pass=pair.slice(i+1);
-  const goodUser=process.env.INBOX_USER||'', goodPass=process.env.INBOX_PASSWORD||'';
-  const safe=(a,b)=>a.length===b.length && crypto.timingSafeEqual(Buffer.from(a),Buffer.from(b));
-  if(!goodUser||!goodPass||!safe(user,goodUser)||!safe(pass,goodPass)) return res.status(401).end('Invalid credentials');
-  next();
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" }
+  });
 }
-app.use(express.json({limit:'1mb', verify:(req,res,buf)=>{ if(req.originalUrl.startsWith('/webhooks/meta')) req.rawBody=Buffer.from(buf); }}));
-app.use('/api', basicAuth);
 
-app.get('/webhooks/meta', (req,res)=>{
-  const mode=req.query['hub.mode'], token=req.query['hub.verify_token'], challenge=req.query['hub.challenge'];
-  if(mode==='subscribe' && token && token===process.env.META_VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
-function validMetaSignature(req) {
-  const secret=process.env.META_APP_SECRET; if(!secret) return false;
-  const signature=req.get('x-hub-signature-256')||'';
-  if(!signature.startsWith('sha256=')) return false;
-  const expected='sha256='+crypto.createHmac('sha256',secret).update(req.rawBody||Buffer.from(JSON.stringify(req.body))).digest('hex');
-  const a=Buffer.from(signature), b=Buffer.from(expected);
-  return a.length===b.length && crypto.timingSafeEqual(a,b);
-}
-function saveInbound({platform,customerId,customerName,text,id,at}) {
-  const conversationId=`${platform}:${customerId}`; const createdAt=at||new Date().toISOString();
-  const messageId=String(id||`${conversationId}:${createdAt}:${crypto.randomUUID()}`);
-  upsertConversation.run({id:conversationId,platform,customer_id:String(customerId),customer_name:customerName||null,last_message:text||'[رسالة بدون نص]',last_at:createdAt,unread:1});
-  insertMessage.run({id:messageId,conversation_id:conversationId,platform,direction:'in',body:text||'[محتوى غير نصي]',created_at:createdAt,sender_name:customerName||null,status:'received'});
-}
-app.post('/webhooks/meta',(req,res)=>{
-  if(!validMetaSignature(req)) return res.sendStatus(401);
+function basicAuth(request, env) {
+  const header = request.headers.get("Authorization") || "";
+  if (!header.startsWith("Basic ")) return false;
+
   try {
-    const body=req.body||{};
-    if(body.object==='whatsapp_business_account') {
-      for(const entry of body.entry||[]) for(const change of entry.changes||[]) {
-        if(change.field!=='messages') continue;
-        const v=change.value||{}; const contacts=v.contacts||[]; const names=new Map(contacts.map(c=>[c.wa_id,c.profile&&c.profile.name]));
-        for(const m of v.messages||[]) saveInbound({platform:'whatsapp',customerId:m.from,customerName:names.get(m.from),text:m.text?.body||`[${m.type||'media'}]`,id:m.id,at:m.timestamp?new Date(Number(m.timestamp)*1000).toISOString():undefined});
-      }
-    } else if(body.object==='page' || body.object==='instagram') {
-      const platform=body.object==='instagram'?'instagram':'facebook';
-      for(const entry of body.entry||[]) for(const event of entry.messaging||[]) {
-        if(event.message && !event.message.is_echo && event.sender?.id) saveInbound({platform,customerId:event.sender.id,text:event.message.text||'[محتوى غير نصي]',id:event.message.mid,at:event.timestamp?new Date(Number(event.timestamp)).toISOString():undefined});
+    const decoded = atob(header.slice(6));
+    const index = decoded.indexOf(":");
+    const user = decoded.slice(0, index);
+    const pass = decoded.slice(index + 1);
+
+    return user === env.INBOX_USER &&
+           pass === env.INBOX_PASSWORD &&
+           !!env.INBOX_USER &&
+           !!env.INBOX_PASSWORD;
+  } catch {
+    return false;
+  }
+}
+
+async function verifySignature(request, body, secret) {
+  if (!secret) return false;
+  const signature = request.headers.get("X-Hub-Signature-256") || "";
+  if (!signature.startsWith("sha256=")) return false;
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const digest = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(body)
+  );
+
+  const expected = "sha256=" +
+    [...new Uint8Array(digest)]
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("");
+
+  return signature === expected;
+}
+
+async function saveMessage(env, platform, customerId, text, id, name = null, time = null) {
+  const conversationId = `${platform}:${customerId}`;
+  const createdAt = time || new Date().toISOString();
+  const messageId = String(id || crypto.randomUUID());
+
+  await env.DB.prepare(`
+    INSERT INTO conversations
+    (id, platform, customer_id, customer_name, last_message, last_at, unread)
+    VALUES (?, ?, ?, ?, ?, ?, 1)
+    ON CONFLICT(id) DO UPDATE SET
+    customer_name = COALESCE(excluded.customer_name, conversations.customer_name),
+    last_message = excluded.last_message,
+    last_at = excluded.last_at,
+    unread = conversations.unread + 1
+  `).bind(
+    conversationId, platform, String(customerId),
+    name, text, createdAt
+  ).run();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO messages
+    (id, conversation_id, platform, direction, body, created_at, sender_name, status)
+    VALUES (?, ?, ?, 'in', ?, ?, ?, 'received')
+  `).bind(
+    messageId, conversationId, platform,
+    text, createdAt, name
+  ).run();
+}
+
+async function handleWebhook(request, env) {
+  const url = new URL(request.url);
+
+  if (request.method === "GET") {
+    const mode = url.searchParams.get("hub.mode");
+    const token = url.searchParams.get("hub.verify_token");
+    const challenge = url.searchParams.get("hub.challenge");
+
+    if (mode === "subscribe" && token === env.META_VERIFY_TOKEN) {
+      return new Response(challenge || "", { status: 200 });
+    }
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  const raw = await request.text();
+  if (!(await verifySignature(request, raw, env.META_APP_SECRET))) {
+    return new Response("Invalid signature", { status: 401 });
+  }
+
+  const body = JSON.parse(raw);
+
+  if (body.object === "whatsapp_business_account") {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.field !== "messages") continue;
+        const value = change.value || {};
+        const contacts = value.contacts || [];
+
+        for (const message of value.messages || []) {
+          const contact = contacts.find(c => c.wa_id === message.from);
+          const time = message.timestamp
+            ? new Date(Number(message.timestamp) * 1000).toISOString()
+            : null;
+
+          await saveMessage(
+            env, "whatsapp", message.from,
+            message.text?.body || `[${message.type || "media"}]`,
+            message.id, contact?.profile?.name, time
+          );
+        }
       }
     }
-    res.sendStatus(200);
-  } catch(err) { console.error('Webhook processing error',err); res.sendStatus(500); }
-});
+  } else if (body.object === "page" || body.object === "instagram") {
+    const platform = body.object === "instagram" ? "instagram" : "facebook";
 
-app.get('/api/status',(req,res)=>res.json({ok:true,configured:{facebook:!!(process.env.FACEBOOK_PAGE_ID&&process.env.FACEBOOK_PAGE_ACCESS_TOKEN),instagram:!!(process.env.INSTAGRAM_ACCOUNT_ID&&process.env.INSTAGRAM_PAGE_ACCESS_TOKEN),whatsapp:!!(process.env.WHATSAPP_PHONE_NUMBER_ID&&process.env.WHATSAPP_ACCESS_TOKEN)},webhook:'/webhooks/meta'}));
-app.get('/api/conversations',(req,res)=>{
- const rows=db.prepare('SELECT * FROM conversations ORDER BY last_at DESC LIMIT 300').all();
- res.json(rows);
-});
-app.get('/api/conversations/:id/messages',(req,res)=>{
- const rows=db.prepare('SELECT * FROM messages WHERE conversation_id=? ORDER BY created_at ASC LIMIT 500').all(req.params.id);
- db.prepare('UPDATE conversations SET unread=0 WHERE id=?').run(req.params.id);
- res.json(rows);
-});
-app.post('/api/send',async(req,res)=>{
- try {
-  const {conversationId,text,operator}=req.body||{};
-  if(!conversationId||!text?.trim()) return res.status(400).json({error:'conversationId and text are required'});
-  const c=db.prepare('SELECT * FROM conversations WHERE id=?').get(conversationId);
-  if(!c) return res.status(404).json({error:'Conversation not found'});
-  const version=requiredEnv('GRAPH_API_VERSION'); let url, token, payload;
-  if(c.platform==='whatsapp') {
-    token=requiredEnv('WHATSAPP_ACCESS_TOKEN'); const phoneId=requiredEnv('WHATSAPP_PHONE_NUMBER_ID');
-    url=`https://graph.facebook.com/${version}/${phoneId}/messages`;
-    payload={messaging_product:'whatsapp',recipient_type:'individual',to:c.customer_id,type:'text',text:{preview_url:false,body:text.trim()}};
-  } else if(c.platform==='facebook') {
-    token=requiredEnv('FACEBOOK_PAGE_ACCESS_TOKEN'); const pageId=requiredEnv('FACEBOOK_PAGE_ID');
-    url=`https://graph.facebook.com/${version}/${pageId}/messages`;
-    payload={recipient:{id:c.customer_id},messaging_type:'RESPONSE',message:{text:text.trim()}};
-  } else if(c.platform==='instagram') {
-    token=requiredEnv('INSTAGRAM_PAGE_ACCESS_TOKEN'); const accountId=requiredEnv('INSTAGRAM_ACCOUNT_ID');
-    url=`https://graph.facebook.com/${version}/${accountId}/messages`;
-    payload={recipient:{id:c.customer_id},message:{text:text.trim()}};
-  } else return res.status(400).json({error:'Unsupported platform'});
-  const response=await fetch(url,{method:'POST',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const result=await response.json();
-  if(!response.ok) return res.status(response.status).json({error:'Meta send failed',details:result});
-  const createdAt=new Date().toISOString(); const messageId=result.message_id||result.messages?.[0]?.id||crypto.randomUUID();
-  insertMessage.run({id:String(messageId),conversation_id:conversationId,platform:c.platform,direction:'out',body:text.trim(),created_at:createdAt,sender_name:operator||'موظف',status:'sent'});
-  upsertConversation.run({id:conversationId,platform:c.platform,customer_id:c.customer_id,customer_name:c.customer_name,last_message:text.trim(),last_at:createdAt,unread:0});
-  res.json({ok:true,id:messageId});
- } catch(err) { console.error(err); res.status(500).json({error:err.message||'Send failed'}); }
-});
-app.use(express.static(path.join(__dirname,'..')));
-const port=Number(process.env.PORT||3000);
-app.listen(port,()=>console.log(`Crispy Town inbox listening on :${port}`));
+    for (const entry of body.entry || []) {
+      for (const event of entry.messaging || []) {
+        if (!event.message || event.message.is_echo || !event.sender?.id) continue;
+
+        await saveMessage(
+          env, platform, event.sender.id,
+          event.message.text || "[محتوى غير نصي]",
+          event.message.mid,
+          null,
+          event.timestamp ? new Date(Number(event.timestamp)).toISOString() : null
+        );
+      }
+    }
+  }
+
+  return new Response("EVENT_RECEIVED", { status: 200 });
+}
+
+async function sendMessage(request, env) {
+  const { conversationId, text, operator } = await request.json();
+
+  if (!conversationId || !text?.trim()) {
+    return json({ error: "conversationId and text are required" }, 400);
+  }
+
+  const conversation = await env.DB.prepare(
+    "SELECT * FROM conversations WHERE id = ?"
+  ).bind(conversationId).first();
+
+  if (!conversation) return json({ error: "Conversation not found" }, 404);
+
+  let token, url, payload;
+  const version = env.GRAPH_API_VERSION;
+
+  if (!version) return json({ error: "Graph API version missing" }, 500);
+
+  if (conversation.platform === "whatsapp") {
+    token = env.WHATSAPP_ACCESS_TOKEN;
+    url = `https://graph.facebook.com/${version}/${env.WHATSAPP_PHONE_NUMBER_ID}/messages`;
+    payload = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: conversation.customer_id,
+      type: "text",
+      text: { preview_url: false, body: text.trim() }
+    };
+  } else if (conversation.platform === "facebook") {
+    token = env.FACEBOOK_PAGE_ACCESS_TOKEN;
+    url = `https://graph.facebook.com/${version}/${env.FACEBOOK_PAGE_ID}/messages`;
+    payload = {
+      recipient: { id: conversation.customer_id },
+      messaging_type: "RESPONSE",
+      message: { text: text.trim() }
+    };
+  } else if (conversation.platform === "instagram") {
+    token = env.INSTAGRAM_PAGE_ACCESS_TOKEN;
+    url = `https://graph.facebook.com/${version}/${env.INSTAGRAM_ACCOUNT_ID}/messages`;
+    payload = {
+      recipient: { id: conversation.customer_id },
+      message: { text: text.trim() }
+    };
+  } else {
+    return json({ error: "Unsupported platform" }, 400);
+  }
+
+  if (!token) return json({ error: "Platform token missing" }, 500);
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    return json({ error: "Meta send failed", details: result }, response.status);
+  }
+
+  const id = result.message_id || result.messages?.[0]?.id || crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO messages
+    (id, conversation_id, platform, direction, body, created_at, sender_name, status)
+    VALUES (?, ?, ?, 'out', ?, ?, ?, 'sent')
+  `).bind(
+    String(id), conversationId, conversation.platform,
+    text.trim(), createdAt, operator || "موظف"
+  ).run();
+
+  await env.DB.prepare(`
+    UPDATE conversations SET last_message = ?, last_at = ? WHERE id = ?
+  `).bind(text.trim(), createdAt, conversationId).run();
+
+  return json({ ok: true, id });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    if (path === "/webhooks/meta") {
+      return handleWebhook(request, env);
+    }
+
+    if (path.startsWith("/api/")) {
+      if (!basicAuth(request, env)) {
+        return new Response("Authentication required", {
+          status: 401,
+          headers: {
+            ...corsHeaders,
+            "WWW-Authenticate": 'Basic realm="Crispy Town Inbox"'
+          }
+        });
+      }
+
+      if (path === "/api/status" && request.method === "GET") {
+        return json({
+          ok: true,
+          database: !!env.DB,
+          configured: {
+            facebook: !!(env.FACEBOOK_PAGE_ID && env.FACEBOOK_PAGE_ACCESS_TOKEN),
+            instagram: !!(env.INSTAGRAM_ACCOUNT_ID && env.INSTAGRAM_PAGE_ACCESS_TOKEN),
+            whatsapp: !!(env.WHATSAPP_PHONE_NUMBER_ID && env.WHATSAPP_ACCESS_TOKEN)
+          },
+          webhook: "/webhooks/meta"
+        });
+      }
+
+      if (path === "/api/conversations" && request.method === "GET") {
+        const result = await env.DB.prepare(
+          "SELECT * FROM conversations ORDER BY last_at DESC LIMIT 300"
+        ).all();
+        return json(result.results || []);
+      }
+
+      if (path.startsWith("/api/conversations/") && path.endsWith("/messages") && request.method === "GET") {
+        const id = decodeURIComponent(path.slice(
+          "/api/conversations/".length,
+          -"/messages".length
+        ));
+
+        const result = await env.DB.prepare(
+          "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC LIMIT 500"
+        ).bind(id).all();
+
+        await env.DB.prepare(
+          "UPDATE conversations SET unread = 0 WHERE id = ?"
+        ).bind(id).run();
+
+        return json(result.results || []);
+      }
+
+      if (path === "/api/send" && request.method === "POST") {
+        return sendMessage(request, env);
+      }
+    }
+
+    if (path === "/") {
+      return new Response("Crispy Town Worker is running", {
+        headers: corsHeaders
+      });
+    }
+
+    return json({ error: "Not found", path }, 404);
+  }
+};
