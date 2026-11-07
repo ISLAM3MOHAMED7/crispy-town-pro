@@ -1,0 +1,10 @@
+{
+  "name": "crispy-town-unified-inbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Meta unified inbox backend for Crispy Town POS",
+  "main": "server.js",
+  "scripts": {"start": "node server.js"},
+  "engines": {"node": ">=20"},
+  "dependencies": {"better-sqlite3": "^11.8.1", "dotenv": "^16.4.7", "express": "^4.21.2"}
+}
