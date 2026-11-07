@@ -1,0 +1,16 @@
+
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crispy-town-pro",
+  "main": "server.js",
+  "compatibility_date": "2026-11-08",
+  "compatibility_flags": [],
+  "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "crispy-town-db",
+      "database_id": "PUT_DATABASE_ID_HERE"
+    }
+  ]
+}
