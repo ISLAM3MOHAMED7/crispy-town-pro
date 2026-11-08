@@ -1479,6 +1479,21 @@ th { background:#edf1ee !important; color:#405652 !important; }
 <!-- ===== UNIFIED INBOX (NEW - preserves all existing POS modules) ===== -->
 <div id="inbox" class="main-content">
  <div class="inbox-page">
+  <div id="inboxLoginModal" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.65);align-items:center;justify-content:center;padding:18px">
+   <div style="background:#fff;color:#1f2937;width:min(420px,100%);border-radius:16px;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.3);direction:rtl">
+    <h3 style="font-size:20px;font-weight:800;margin:0 0 8px">تسجيل دخول الشات</h3>
+    <p style="font-size:13px;color:#64748b;margin:0 0 16px">استخدم بيانات INBOX_USER وINBOX_PASSWORD المحفوظة في Cloudflare.</p>
+    <label for="inboxLoginUser" style="display:block;font-size:13px;margin:8px 0 5px">اسم المستخدم</label>
+    <input id="inboxLoginUser" autocomplete="username" style="width:100%;padding:11px;border:1px solid #cbd5e1;border-radius:9px;box-sizing:border-box">
+    <label for="inboxLoginPassword" style="display:block;font-size:13px;margin:12px 0 5px">كلمة المرور</label>
+    <input id="inboxLoginPassword" type="password" autocomplete="current-password" style="width:100%;padding:11px;border:1px solid #cbd5e1;border-radius:9px;box-sizing:border-box">
+    <div id="inboxLoginError" role="alert" style="font-size:12px;color:#b91c1c;margin-top:10px;min-height:18px"></div>
+    <div style="display:flex;gap:8px;margin-top:12px">
+     <button type="button" onclick="submitInboxLogin()" style="flex:1;padding:11px;border:0;border-radius:9px;background:#f07818;color:white;font-weight:800;cursor:pointer">دخول</button>
+     <button type="button" onclick="closeInboxLogin()" style="padding:11px 16px;border:0;border-radius:9px;background:#e5e7eb;color:#111827;cursor:pointer">إلغاء</button>
+    </div>
+   </div>
+  </div>
   <div class="inbox-head"><div><h1><i class="fas fa-comments" style="color:#f07818"></i> الشات الموحد</h1><div class="inbox-sub">Facebook وInstagram وWhatsApp في شاشة واحدة</div></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="inbox-action" onclick="connectInbox()"><i class="fas fa-key"></i> دخول الشات</button><button class="inbox-action" style="background:#526d68" onclick="loadInbox()"><i class="fas fa-sync"></i> تحديث</button></div></div>
   <div class="cloud-strip"><span class="cloud-dot" id="inboxStatusDot"></span><b>حالة الربط:</b> <span id="inboxStatusText">لم يتم التحقق من الخادم بعد</span><span style="margin-right:auto" class="inbox-status" id="inboxStatusDetail">يتطلب إعداد الخادم ومفاتيح Meta</span></div>
   <div class="inbox-layout">
@@ -1649,20 +1664,36 @@ function saveAll() {
 // ===== Unified inbox: secure backend client =====
 let inboxPlatformFilter='all', inboxConversations=[], inboxCurrentConversation=null, inboxMessages=[];
 function inboxAuth(){return sessionStorage.getItem('ct_inbox_auth')||'';}
+const INBOX_API_BASE='https://crispy-town-pro.islam3mohamed7.workers.dev';
 async function inboxApi(path,options={}){
- const headers={...(options.headers||{}),'Content-Type':'application/json'};
+ const headers={...(options.headers||{})};
+ if(options.body && !headers['Content-Type']) headers['Content-Type']='application/json';
  if(inboxAuth()) headers.Authorization='Basic '+inboxAuth();
- const response=await fetch('/api'+path,{...options,headers});
- if(response.status===401){sessionStorage.removeItem('ct_inbox_auth');throw new Error('بيانات الدخول غير صحيحة أو لم يتم تسجيل الدخول');}
+ let response;
+ try {
+  response=await fetch(INBOX_API_BASE+'/api'+path,{...options,headers,mode:'cors',credentials:'omit'});
+ } catch (networkError) {
+  throw new Error('تعذر الوصول إلى خادم Cloudflare. تحقق من اتصال الإنترنت وإعدادات CORS.');
+ }
+ if(response.status===401){sessionStorage.removeItem('ct_inbox_auth');throw new Error('اسم المستخدم أو كلمة المرور غير صحيحين.');}
  const data=await response.json().catch(()=>({}));
- if(!response.ok) throw new Error(data.error||'تعذر الاتصال بخادم الشات');
+ if(!response.ok) throw new Error(data.error||('خطأ من الخادم: '+response.status));
  return data;
 }
-async function connectInbox(){
- const user=prompt('اسم مستخدم الشات (من إعدادات الخادم):'); if(user===null)return;
- const pass=prompt('كلمة مرور الشات:'); if(pass===null)return;
+function connectInbox(){
+ const modal=document.getElementById('inboxLoginModal');
+ if(modal) modal.style.display='flex';
+}
+function closeInboxLogin(){const modal=document.getElementById('inboxLoginModal');if(modal)modal.style.display='none';}
+async function submitInboxLogin(){
+ const user=document.getElementById('inboxLoginUser').value.trim();
+ const pass=document.getElementById('inboxLoginPassword').value;
+ const error=document.getElementById('inboxLoginError');
+ if(!user||!pass){error.textContent='اكتب اسم المستخدم وكلمة المرور.';return;}
  sessionStorage.setItem('ct_inbox_auth',btoa(unescape(encodeURIComponent(user+':'+pass))));
- await loadInbox();
+ error.textContent='جارٍ التحقق من بيانات الدخول...';
+ try { await loadInbox(); if(document.getElementById('inboxStatusText').textContent.includes('الخادم متصل')) closeInboxLogin(); else {sessionStorage.removeItem('ct_inbox_auth');} }
+ catch(e){sessionStorage.removeItem('ct_inbox_auth');error.textContent=e.message;}
 }
 function setInboxPlatform(platform,button){inboxPlatformFilter=platform;document.querySelectorAll('.inbox-filter button').forEach(b=>b.classList.remove('active'));if(button)button.classList.add('active');renderInboxConversations();}
 function inboxPlatformName(p){return p==='facebook'?'Facebook':p==='instagram'?'Instagram':'WhatsApp';}
@@ -1718,7 +1749,7 @@ function goTo(page, btn) {
     document.getElementById(page).classList.add('active');
     if (btn) btn.classList.add('active');
     
-    if (page === 'inbox') loadInbox();
+    if (page === 'inbox') { if (inboxAuth()) loadInbox(); else connectInbox(); }
     if (page === 'orders') renderOrders();
     if (page === 'received') renderReceivedOrders();
     if (page === 'cancelled') renderCancelledOrders();
